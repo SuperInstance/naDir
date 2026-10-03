@@ -1,115 +1,126 @@
 # naDir
 
-**A running job is just a directory. When it's done, the directory moves.**
+**Every action an agent takes leaves a traceable record — what it did, where it came from, where it went.**
 
-naDir ("native directory") is a way to track async work — builds, agent tasks, background jobs, anything that starts now and finishes later — using nothing but directories. No server. No database. No dashboard to install.
+naDir ("native directory") is infrastructure for multi-agent systems. When many agents work across many projects — each in their own area of expertise, each in their own conversation thread — naDir gives every unit of work a *place* with an *entry point* and an *exit point*. Double-entry bookkeeping, but the books record provenance: which agent, which source, which destination.
+
+No server. No database. Just directories.
 
 ## The problem
 
-You start a job. It disappears into the void — a background process, an agent's context, a queue somewhere. To know what happened, you poll, you grep logs, you check a dashboard, or you forget about it entirely. Dispatched work is invisible. It has no place.
+You have agents working in parallel. Agent A researches, Agent B writes code, Agent C deploys. Work flows between them — but where did that data come from? Which agent touched it? What did the project look like before and after?
+
+Right now, that provenance evaporates. It lives in conversation threads, in terminal scrollback, in nobody's memory. When something breaks, you can't follow the thread. When you want to understand what happened, you reconstruct it by hand.
 
 ## The idea
 
-Every unit of work gets a directory that *records* it. When you start something, you open an entry:
+Every unit of agent work opens a ledger entry that records **provenance** — not just what happened, but where it came from and where it's going:
 
 ```
-ledger/open/build-47/
-  intent.md     ← what was asked, by whom, when
-  output.log    ← growing log, written as it runs
-  meta.json     ← started_at, heartbeat_at, owner (required)
+ledger/open/20261003-1423-research/
+  intent.md     ← what the agent was asked to do
+  meta.json     ← agent id, started_at, heartbeat_at, source, project
+  inputs/       ← references to what was consumed (prior entries, files, data)
+  output.log    ← running output
 ```
 
-When it finishes, the directory moves:
+When the work completes, the entry closes with its destination:
 
 ```
-ledger/closed/build-47/
-  intent.md     ← carried over
-  output.log    ← final log
-  meta.json     ← carried over
-  result.md     ← success | failed, exit code, one-line summary
+ledger/closed/20261003-1423-research/
+  intent.md
+  meta.json
+  output.log
+  outputs/      ← references to what was produced
+  result.md     ← success | failed, summary
 ```
 
-That's the whole system. Two folders: `open/` and `closed/`. Starting work creates a directory. Finishing work moves it. If you started ten things and eight are closed, the two still in `open/` are your in-flight work — visible at a glance.
+The critical fields in `meta.json`:
 
-To be precise about the tagline: the directory is the job's *record*, not the job itself. Copying the directory doesn't teleport a running process. What it does — and this is the part that matters — is package the *entire context* of the work (intent, partial output, metadata) into something you can hand to another machine, another agent, another person. The handoff is the address.
+```json
+{
+  "agent": "researcher-3",
+  "project": "syzygy",
+  "started_at": "2026-10-03T14:23:00Z",
+  "heartbeat_at": "2026-10-03T14:45:00Z",
+  "source": "ledger/closed/20261003-1401-brief",
+  "source_agent": "coordinator-1"
+}
+```
+
+Every entry points backward to where its inputs came from and forward to where its outputs go. The ledger isn't a list — it's a **provenance graph** written as directories.
+
+## What this enables: follow anything
+
+Because every entry records its source and destination, pipelines *emerge* from the ledger. You don't declare them upfront; you discover them by tracing.
+
+**Follow the data** (the fuel's journey):
+A dataset enters as Agent A's input, becomes a report in Agent B's hands, becomes a commit via Agent C, becomes a deploy. Trace `outputs → inputs` chains and you see the exact path that specific data took through your system — like following a gallon of fuel through the engine to exhaust.
+
+**Follow the agent** (who did what):
+Filter by `agent`. Every action `researcher-3` took, across all projects, in order. Useful for review, for debugging ("which agent introduced this?"), for understanding specialization patterns.
+
+**Follow the project** (the boat's journey):
+Filter by `project` and `time`. The same events as the fuel's journey, but now you're watching the *system's* state change over that period — not the data's. Same ledger, different abstraction. The boat moving, not the fuel burning.
+
+**Follow the time** (cross-section):
+What was every agent doing at 14:30? Which entries were open? The ledger is a snapshot of your entire fleet at any moment — queryable with `ls` and `grep` today, with spreadsheet projections tomorrow.
+
+## The agent contract
+
+If you're building an agent that writes to naDir, here's the entire API — shell commands, no library:
+
+```bash
+# Open: when the agent starts work
+NAME="$(date +%Y%m%d-%H%M)-<task-slug>"
+mkdir -p ledger/open/$NAME/inputs
+cat > ledger/open/$NAME/intent.md <<EOF
+# $TASK_DESCRIPTION
+EOF
+cat > ledger/open/$NAME/meta.json <<EOF
+{
+  "agent": "$AGENT_ID",
+  "project": "$PROJECT",
+  "started_at": "$(date -u +%FT%TZ)",
+  "heartbeat_at": "$(date -u +%FT%TZ)",
+  "source": "$SOURCE_ENTRY",
+  "source_agent": "$SOURCE_AGENT_ID"
+}
+EOF
+
+# During: heartbeat and output
+echo "$(date -u +%FT%TZ)" > /tmp/hb  # update meta.json heartbeat periodically
+echo "working..." >> ledger/open/$NAME/output.log
+
+# Close: when the agent finishes
+cat > ledger/open/$NAME/result.md <<EOF
+success — <one-line summary>
+EOF
+mkdir -p ledger/open/$NAME/outputs
+# ... record output references in outputs/ ...
+mv ledger/open/$NAME ledger/closed/$NAME
+```
+
+Three moments: open, heartbeat, close. That's the contract. Any agent that can run shell commands can implement it in minutes.
 
 ## Keeping the books honest
 
-The ledger only works if `open/` means "actually running." Three conventions keep it honest:
-
-1. **Heartbeat.** Every open entry has `meta.json` with `heartbeat_at`, updated periodically by whatever is doing the work. An entry whose heartbeat is older than your threshold (an hour? a day? — your call) is *stale*, not running.
-2. **Reaper.** Something — a cron job, a wrapper script, you — periodically scans `open/` for stale entries and moves them to `ledger/abandoned/` with a note. The books balance because *something* closes every entry, even the dead ones.
-3. **Unique names.** Two writers picking `build-47` will collide. Use timestamps, UUIDs, or namespaced names (`agent1-build-47`). Check before creating.
-
-Without these, `open/` accumulates corpses and the "visible at a glance" promise rots. The format is simple; the discipline is load-bearing.
+- **Heartbeat.** `meta.json` → `heartbeat_at`, updated while work is in flight. Stale = heartbeat older than your threshold.
+- **Reaper.** Something scans `open/` for stale entries, moves them to `ledger/abandoned/` with a note. Every entry gets closed, even the dead ones.
+- **Unique names.** Timestamp + slug + agent id. Check before creating.
 
 ## Why directories, not a database?
 
-The obvious question. Four reasons:
-
-- **Zero install.** `mkdir -p ledger/open ledger/closed` and you're running. No service to configure, no schema to migrate.
-- **Unix-native.** `ls`, `cat`, `grep`, `find` — every tool you already have works on the ledger. No query language to learn.
-- **Git-versionable.** Commit the ledger (minus the logs — see below) and your async history is time-travelable.
-- **Human-readable.** You can debug the system by looking at it. No opaque binary format between you and the truth.
-
-A database would give you atomicity and queries. naDir trades those for simplicity and transparency. If you need transactions, you already have a database — naDir isn't replacing it.
-
-## Sharp edges
-
-Honest limitations, so you can work around them:
-
-- **Not atomic by default.** Write `result.md` to a temp file, then atomically rename it into place, *then* move the directory. Crash between steps and you'll have an entry that's half-closed. The filesystem gives you the tools; the discipline is yours.
-- **Not concurrent-safe.** One writer per ledger, or unique names plus atomic creates. Two processes writing to the same entry will step on each other.
-- **Don't version the logs.** `output.log` will grow. Git-commit the ledger structure (`intent.md`, `meta.json`, `result.md`), `.gitignore` the logs, or your repo becomes unpushable.
-- **naDir doesn't run anything.** Your existing tools do the work; naDir holds the record. The writers that automate open/close don't exist yet — for now, it's a discipline, and disciplines need the heartbeat/reaper conventions above to survive contact with reality.
-
-## Why this matters
-
-Because the record is just files, file operations become job operations:
-
-- **See what's running** — `ls ledger/open/`
-- **Check on a job** — `cat ledger/open/build-47/output.log`
-- **Hand a job's context to another machine** — `cp -r ledger/open/build-47 /other/machine/ledger/open/` and something there picks it up
-- **Snapshot everything in flight** — `tar -czf snapshot.tgz ledger/open/`
-- **Find failures** — sort `ledger/closed/` by `result.md`. Failures have *places*.
-- **Audit** — `git log` on the ledger is your async history
-
-## The format
-
-An open entry (all fields required unless noted):
-
-```
-ledger/open/<unique-name>/
-  intent.md    — what was asked, by whom, when
-  meta.json    — {"started_at": "...", "heartbeat_at": "...", "owner": "..."}
-  output.log   — running output (optional, appended as it runs)
-```
-
-A closed entry adds:
-
-```
-  result.md    — success | failed, exit code, one-line summary
-```
-
-Abandoned entries (moved by the reaper):
-
-```
-ledger/abandoned/<unique-name>/
-  intent.md, meta.json, output.log (if any)
-  abandoned.md — when it was reaped, last heartbeat age
-```
+- **Zero install.** `mkdir` and you're running. Any agent, any machine.
+- **Portable.** `cp -r` an entry to another machine and the *entire context* — intent, inputs, partial output, provenance — goes with it. Handoff is addressing.
+- **Git-versionable.** Commit the ledger (not the logs) and you have time-travel over everything your agents did.
+- **Human-readable.** The human operator debugs the fleet by looking at directories.
 
 ## What this isn't
 
-- Not a job runner. naDir doesn't execute anything.
-- Not a dashboard. The directory *is* the interface. (Projections read the ledger; they don't replace it.)
-- Not a queue. No scheduling, no priorities, no workers.
-
-## What's coming
-
-- **Writers** — shell wrappers and hooks so tools open/close entries automatically instead of by hand.
-- **Projectors** — spreadsheet and web views rendering the ledger as a live grid. Sort by status, filter by staleness, zoom into any entry.
-- **Handoff** — an agent reads an open entry on one machine and resumes the work on another. The directory is the context transfer.
+- Not a runner, scheduler, or queue. Your agents already do the work.
+- Not a dashboard. Projections (spreadsheet views, web UIs) read the ledger; the ledger is the source of truth.
+- Not a replacement for any single system's native tracking. It's the *cross-system* layer — the one place where work from all your agents, all your projects, is visible together.
 
 ## Start
 
@@ -118,4 +129,4 @@ mkdir -p ledger/open ledger/closed ledger/abandoned
 echo "*.log" > ledger/.gitignore
 ```
 
-That's the install. You're running naDir.
+Point your first agent at it. Watch the provenance graph grow.
