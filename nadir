@@ -1,0 +1,222 @@
+#!/bin/bash
+# nadir - directory-native async ledger for agents
+# Usage: nadir <command> [args]
+# Ledger root: $NADIR_LEDGER or ./ledger or ~/ledger
+
+set -e
+
+LEDGER="${NADIR_LEDGER:-./ledger}"
+if [[ ! -d "$LEDGER" && -d "$HOME/ledger" ]]; then
+  LEDGER="$HOME/ledger"
+fi
+
+now_utc() { date -u +%FT%TZ; }
+
+ledger_init() {
+  mkdir -p "$LEDGER/open" "$LEDGER/closed" "$LEDGER/abandoned"
+  echo "*.log" > "$LEDGER/.gitignore" 2>/dev/null || true
+  echo "ledger initialized at $LEDGER"
+}
+
+cmd_open() {
+  local name="$1"; shift
+  local agent="${NADIR_AGENT:-unknown}"
+  local project="${NADIR_PROJECT:-default}"
+  local from_cell=""; local to_cell=""; local source=""; local intent=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent) agent="$2"; shift 2;;
+      --project) project="$2"; shift 2;;
+      --from) from_cell="$2"; shift 2;;
+      --to) to_cell="$2"; shift 2;;
+      --source) source="$2"; shift 2;;
+      --intent) intent="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  if [[ -z "$name" ]]; then echo "usage: nadir open <name> [--agent ID] [--project P] [--from CELL] [--to CELL] [--source ENTRY] [--intent TEXT]"; return 1; fi
+  local dir="$LEDGER/open/$name"
+  if [[ -d "$dir" ]]; then echo "entry already exists: $name"; return 1; fi
+  mkdir -p "$dir/inputs" "$dir/outputs"
+  local ts; ts=$(now_utc)
+  echo "# $name" > "$dir/intent.md"
+  [[ -n "$intent" ]] && echo -e "\n$intent" >> "$dir/intent.md"
+  cat > "$dir/meta.json" <<EOF
+{
+  "agent": "$agent",
+  "project": "$project",
+  "from_cell": "$from_cell",
+  "to_cell": "$to_cell",
+  "source": "$source",
+  "started_at": "$ts",
+  "heartbeat_at": "$ts"
+}
+EOF
+  touch "$dir/output.log"
+  echo "opened: $name"
+}
+
+cmd_heartbeat() {
+  local name="$1"
+  local dir="$LEDGER/open/$name"
+  if [[ ! -d "$dir" ]]; then echo "no such open entry: $name"; return 1; fi
+  local ts; ts=$(now_utc)
+  python3 -c "
+import json
+p = '$dir/meta.json'
+d = json.load(open(p))
+d['heartbeat_at'] = '$ts'
+json.dump(d, open(p, 'w'), indent=2)
+" 2>/dev/null || {
+    # fallback without python: rewrite via sed
+    sed -i 's/"heartbeat_at": "[^"]*"/"heartbeat_at": "'"$ts"'"/' "$dir/meta.json"
+  }
+  echo "heartbeat: $name @ $ts"
+}
+
+cmd_log() {
+  local name="$1"; shift
+  local dir="$LEDGER/open/$name"
+  if [[ ! -d "$dir" ]]; then echo "no such open entry: $name"; return 1; fi
+  echo "$*" >> "$dir/output.log"
+}
+
+cmd_close() {
+  local name="$1"; local result="${2:-success}"; shift 2 || true
+  local summary="$*"
+  local dir="$LEDGER/open/$name"
+  if [[ ! -d "$dir" ]]; then echo "no such open entry: $name"; return 1; fi
+  local ts; ts=$(now_utc)
+  {
+    echo "# Result: $result"
+    echo ""
+    echo "closed_at: $ts"
+    [[ -n "$summary" ]] && echo -e "\n$summary"
+  } > "$dir/result.md"
+  # atomic: write result, then move
+  mv "$dir" "$LEDGER/closed/$name"
+  echo "closed: $name ($result)"
+}
+
+cmd_list() {
+  echo "=== OPEN ==="
+  for d in "$LEDGER"/open/*/; do
+    [[ -d "$d" ]] || continue
+    local n; n=$(basename "$d")
+    local hb; hb=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('heartbeat_at','?'))" 2>/dev/null || echo "?")
+    local ag; ag=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('agent','?'))" 2>/dev/null || echo "?")
+    echo "  $n  agent=$ag  heartbeat=$hb"
+  done
+  echo "=== CLOSED ($(ls "$LEDGER"/closed/ 2>/dev/null | wc -l)) ==="
+  for d in "$LEDGER"/closed/*/; do
+    [[ -d "$d" ]] || continue
+    local n; n=$(basename "$d")
+    local r; r=$(head -1 "$d/result.md" 2>/dev/null | sed 's/# Result: //')
+    echo "  $n  [$r]"
+  done
+  local ab; ab=$(ls "$LEDGER"/abandoned/ 2>/dev/null | wc -l)
+  echo "=== ABANDONED ($ab) ==="
+}
+
+cmd_show() {
+  local name="$1"
+  local dir=""
+  for s in open closed abandoned; do
+    [[ -d "$LEDGER/$s/$name" ]] && dir="$LEDGER/$s/$name" && echo "state: $s" && break
+  done
+  [[ -z "$dir" ]] && { echo "no such entry: $name"; return 1; }
+  echo "--- intent.md ---"; cat "$dir/intent.md" 2>/dev/null
+  echo "--- meta.json ---"; cat "$dir/meta.json" 2>/dev/null
+  [[ -f "$dir/result.md" ]] && { echo "--- result.md ---"; cat "$dir/result.md"; }
+  [[ -f "$dir/abandoned.md" ]] && { echo "--- abandoned.md ---"; cat "$dir/abandoned.md"; }
+  echo "--- output.log (tail) ---"; tail -20 "$dir/output.log" 2>/dev/null
+}
+
+cmd_reaper() {
+  local stale_after="${1:-3600}"  # seconds, default 1h
+  local now; now=$(date +%s)
+  local reaped=0
+  for d in "$LEDGER"/open/*/; do
+    [[ -d "$d" ]] || continue
+    local n; n=$(basename "$d")
+    local hb; hb=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('heartbeat_at',''))" 2>/dev/null || echo "")
+    [[ -z "$hb" ]] && continue
+    local hb_epoch; hb_epoch=$(date -d "$hb" +%s 2>/dev/null || echo 0)
+    local age=$((now - hb_epoch))
+    if [[ $age -gt $stale_after ]]; then
+      local ts; ts=$(now_utc)
+      {
+        echo "# Abandoned"
+        echo ""
+        echo "reaped_at: $ts"
+        echo "last_heartbeat: $hb (${age}s ago)"
+        echo "reason: heartbeat stale beyond ${stale_after}s threshold"
+      } > "$d/abandoned.md"
+      mv "$d" "$LEDGER/abandoned/$n"
+      echo "reaped: $n (stale ${age}s)"
+      reaped=$((reaped+1))
+    fi
+  done
+  echo "reaped $reaped entries"
+}
+
+cmd_trace() {
+  # Follow provenance: show chain from this entry backward via source links
+  local name="$1"
+  local dir=""
+  for s in open closed abandoned; do
+    [[ -d "$LEDGER/$s/$name" ]] && dir="$LEDGER/$s/$name" && break
+  done
+  [[ -z "$dir" ]] && { echo "no such entry: $name"; return 1; }
+  echo "=== trace: $name ==="
+  local current="$name" depth=0
+  while [[ $depth -lt 20 ]]; do
+    local d=""
+    for s in open closed abandoned; do
+      [[ -d "$LEDGER/$s/$current" ]] && d="$LEDGER/$s/$current" && break
+    done
+    [[ -z "$d" ]] && break
+    local ag; ag=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('agent','?'))" 2>/dev/null)
+    local src; src=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('source',''))" 2>/dev/null)
+    local fc; fc=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('from_cell',''))" 2>/dev/null)
+    local tc; tc=$(python3 -c "import json; print(json.load(open('$d/meta.json')).get('to_cell',''))" 2>/dev/null)
+    printf '%*s%s (agent=%s)' $((depth*2)) '' "$current" "$ag"
+    [[ -n "$fc" || -n "$tc" ]] && printf '  %s -> %s' "$fc" "$tc"
+    echo ""
+    [[ -z "$src" ]] && break
+    current="$src"
+    depth=$((depth+1))
+  done
+}
+
+cmd_help() {
+  cat <<EOF
+nadir - directory-native async ledger
+
+  nadir init                          create ledger dirs
+  nadir open <name> [opts]            open entry
+      --agent ID --project P --from CELL --to CELL --source ENTRY --intent TEXT
+  nadir heartbeat <name>              update heartbeat
+  nadir log <name> <message>          append to output.log
+  nadir close <name> [success|failed] [summary]
+  nadir list                          show open/closed/abandoned
+  nadir show <name>                   full entry details
+  nadir reaper [stale_seconds]        move stale entries to abandoned/
+  nadir trace <name>                  follow provenance chain backward
+
+env: NADIR_LEDGER (ledger root), NADIR_AGENT (default agent id), NADIR_PROJECT
+EOF
+}
+
+case "${1:-help}" in
+  init) ledger_init;;
+  open) shift; cmd_open "$@";;
+  heartbeat|hb) shift; cmd_heartbeat "$@";;
+  log) shift; cmd_log "$@";;
+  close) shift; cmd_close "$@";;
+  list|ls) cmd_list;;
+  show) shift; cmd_show "$@";;
+  reaper) shift; cmd_reaper "$@";;
+  trace) shift; cmd_trace "$@";;
+  *) cmd_help;;
+esac
